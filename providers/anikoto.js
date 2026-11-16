@@ -1,8 +1,16 @@
 import { getMedia } from '../core/anilist.js';
 import { extractMegaPlayDetails } from "../extractors/megaplay.js";
 import { buildTitleSearchQueries, buildTitles, decodeEntities, titleIdentityScore } from "../core/new-provider-utils.js";
+import { wreqFetch } from "../core/wreq.js";
 
-const ANIKOTO = "https://anikototv.to";
+// Anikoto mirrors / rotates its domain. Put one or more bases (comma separated) in the ANIKOTO_BASES
+// env var to switch without touching code. The first is tried first, the rest are failovers.
+function readEnv(name) {
+  try { return typeof process !== "undefined" ? process.env?.[name] : undefined; } catch { return undefined; }
+}
+const ANIKOTO_BASES = String(readEnv("ANIKOTO_BASES") || "https://anikoto.cz")
+  .split(",").map((base) => base.trim().replace(/\/+$/, "")).filter(Boolean);
+let ANIKOTO = ANIKOTO_BASES[0];
 const MAPPER = "https://mapper.nekostream.site/api/mal";
 const ANIZIP = "https://api.ani.zip/mappings";
 const SPOOF_REF = "https://hianimes.re/";
@@ -18,23 +26,63 @@ function normalize(s) {
   return (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
+const BLOCK_STATUS = new Set([403, 429, 503]);
+const CHALLENGE_RE = /<title>\s*(?:just a moment|attention required)|cf-browser-verification|checking your browser before accessing/i;
+
+function looksBlocked(status, body = "") {
+  return BLOCK_STATUS.has(status) || CHALLENGE_RE.test(String(body ?? "").slice(0, 6000));
+}
+
+// Plain fetch first (same behaviour as before). If it throws or the site answers 403/429/503, retry once
+// with the browser-impersonating client that senshi / anipm / mkissa already use. Only for the site itself.
+async function request(url, headers = {}) {
+  const init = { headers: { "User-Agent": UA, ...headers } };
+  let res = null;
+  let netError = null;
+  try {
+    res = await fetch(url, init);
+  } catch (error) {
+    netError = error;
+  }
+  const onSite = ANIKOTO_BASES.some((base) => url.startsWith(base));
+  if (onSite && (!res || BLOCK_STATUS.has(res.status))) {
+    try {
+      const alt = await wreqFetch(url, { session: "anikoto", headers: init.headers });
+      if (alt && (alt.ok || !res)) { res = alt; netError = null; }
+    } catch (error) {
+      netError = netError || error;
+    }
+  }
+  if (!res) {
+    const code = netError?.cause?.code || netError?.code || netError?.message || "network error";
+    const err = new Error(`Anikoto unreachable (${code}) fetching ${url}`);
+    err.reason = "unreachable";
+    throw err;
+  }
+  return res;
+}
+
 async function httpGet(url, headers = {}) {
-  const res = await fetch(url, { headers: { "User-Agent": UA, Accept: "text/html,*/*", ...headers } });
+  const res = await request(url, { Accept: "text/html,*/*", ...headers });
+  const body = await res.text().catch(() => null);
   if (!res.ok) {
-    const _raw = await res.text().catch(() => null);
     const _e = new Error(`HTTP ${res.status} fetching ${url}`);
-    _e.rawBody = _raw;
+    _e.status = res.status;
+    _e.rawBody = body;
+    _e.reason = looksBlocked(res.status, body) ? "blocked" : "http_error";
     throw _e;
   }
-  return res.text();
+  return body ?? "";
 }
 
 async function getJSON(url, headers = {}) {
-  const res = await fetch(url, { headers: { "User-Agent": UA, Accept: "application/json,*/*", ...headers } });
+  const res = await request(url, { Accept: "application/json,*/*", ...headers });
   if (!res.ok) {
     const _raw = await res.text().catch(() => null);
     const _e = new Error(`HTTP ${res.status} fetching ${url}`);
+    _e.status = res.status;
     _e.rawBody = _raw;
+    _e.reason = looksBlocked(res.status, _raw) ? "blocked" : "http_error";
     throw _e;
   }
   return res.json();
@@ -84,11 +132,13 @@ function scoreCandidate(cand, primaryEn, primaryRom, synonyms) {
   return score;
 }
 
-async function searchAnikoto(query) {
+async function searchAnikoto(query, diag) {
+  if (diag) diag.attempts++;
   const searchHtml = await httpGet(`${ANIKOTO}/filter?keyword=${encodeURIComponent(query)}`, { Referer: `${ANIKOTO}/` });
   const candidates = [];
-  
-  const re = /<a\s+class="name d-title"\s+href="https:\/\/anikototv\.to\/watch\/([^"/]+)(?:\/ep-\d+)?"[^>]*data-jp="([^"]*)"[^>]*>([\s\S]*?)<\/a>/g;
+
+  // Host-agnostic on purpose: the site may answer with absolute links on another host, or relative ones.
+  const re = /<a\s+class="name d-title"\s+href="(?:https?:\/\/[^"\/]+)?\/watch\/([^"/]+)(?:\/ep-\d+)?"[^>]*data-jp="([^"]*)"[^>]*>([\s\S]*?)<\/a>/g;
   let m;
   while ((m = re.exec(searchHtml)) !== null) {
     const slug = m[1];
@@ -98,9 +148,21 @@ async function searchAnikoto(query) {
   }
 
   if (!candidates.length) {
-    const reFallback = /<a\s+href="https:\/\/anikototv\.to\/watch\/([^"/]+)(?:\/ep-\d+)?"[^>]*>([\s\S]*?)<\/a>/g;
+    const reFallback = /<a\s+[^>]*?href="(?:https?:\/\/[^"\/]+)?\/watch\/([^"/]+)(?:\/ep-\d+)?"[^>]*>([\s\S]*?)<\/a>/g;
     while ((m = reFallback.exec(searchHtml)) !== null) {
       candidates.push({ slug: m[1], name: m[1], jp: "" });
+    }
+  }
+
+  if (diag) {
+    diag.ok++;
+    if (!candidates.length) {
+      diag.empty++;
+      if (looksBlocked(200, searchHtml)) diag.blocked++;
+      if (diag.sampleTitle === null) {
+        diag.sampleTitle = (searchHtml.match(/<title>([\s\S]*?)<\/title>/i)?.[1] ?? "").replace(/\s+/g, " ").trim().slice(0, 80);
+        diag.sampleBytes = searchHtml.length;
+      }
     }
   }
 
@@ -138,37 +200,98 @@ function parseEpisodeRows(html) {
 async function inspectAnikotoCandidate(candidate) {
   const watchHtml = await httpGet(`${ANIKOTO}/watch/${candidate.slug}`, { Referer: `${ANIKOTO}/` });
   const showId = watchHtml.match(/data-id="(\d+)"/)?.[1];
-  if (!showId) return null;
+  if (!showId) throw Object.assign(new Error(`watch page ${candidate.slug} has no numeric data-id (page markup changed?)`), { reason: "inspect_failed" });
   const listJson = await getJSON(`${ANIKOTO}/ajax/episode/list/${showId}`, {
     "X-Requested-With": "XMLHttpRequest",
     Referer: `${ANIKOTO}/watch/${candidate.slug}`,
   });
   const episodes = parseEpisodeRows(listJson.result || "");
-  return episodes.length ? { ...candidate, showId, episodes } : null;
+  if (!episodes.length) throw Object.assign(new Error(`episode list for ${candidate.slug} (show ${showId}) had no parsable rows (endpoint or attributes changed?)`), { reason: "inspect_failed" });
+  return { ...candidate, showId, episodes };
+}
+
+async function searchAllKeywords(keywords) {
+  const diag = { base: ANIKOTO, attempts: 0, ok: 0, failed: 0, empty: 0, blocked: 0, firstError: null, sampleTitle: null, sampleBytes: 0 };
+  const found = new Map();
+  for (let index = 0; index < keywords.length; index += 4) {
+    const results = await Promise.all(keywords.slice(index, index + 4).map((keyword) =>
+      searchAnikoto(keyword, diag).catch((error) => {
+        diag.failed++;
+        if (error.reason === "blocked") diag.blocked++;
+        diag.firstError = diag.firstError || error;
+        return [];
+      })));
+    for (const list of results) for (const candidate of list) found.set(candidate.slug, candidate);
+  }
+  return { found, diag };
+}
+
+// Turns "nothing found" into something you can act on (the old code swallowed every search error).
+function explainNoCandidates(attempts, scored) {
+  let reason = "title_mismatch";
+  const parts = attempts.map((d) => {
+    const partial = d.failed && d.failed < d.attempts ? ` (${d.failed}/${d.attempts} searches failed)` : "";
+    if (d.attempts && d.failed === d.attempts) {
+      reason = d.blocked ? "blocked" : (d.firstError?.reason || "unreachable");
+      return `${d.base}: all ${d.attempts} searches failed - ${d.blocked ? "BLOCKED (Cloudflare / bot protection)" : "site unreachable or erroring"}: ${d.firstError?.message}`;
+    }
+    if (!scored.length) {
+      reason = d.blocked ? "blocked" : "no_results";
+      return `${d.base}: site answered but no title links were found in any result page (page title "${d.sampleTitle ?? ""}", ${d.sampleBytes} bytes) - challenge page, empty results, or the site's markup/domain changed${partial}`;
+    }
+    const top = [...scored].sort((a, b) => b.titleScore - a.titleScore).slice(0, 3)
+      .map((c) => `"${c.name}" (${c.titleScore.toFixed(2)})`).join(", ");
+    return `${d.base}: ${scored.length} result(s) found but none similar enough to the AniList titles; closest: ${top}${partial}`;
+  });
+  return { reason, text: parts.join(" | ") };
 }
 
 async function findAnikotoShow(media, anizip) {
   const mappings = anizip ?? await getJSON(`${ANIZIP}?anilist_id=${media.id}`).catch(() => null);
   const titles = [...new Set(buildTitles(media, mappings).filter(Boolean))];
   const keywords = buildTitleSearchQueries(titles, 18);
-  const allCandidatesMap = new Map();
-  for (let index = 0; index < keywords.length; index += 4) {
-    const results = await Promise.all(keywords.slice(index, index + 4).map((keyword) => searchAnikoto(keyword).catch(() => [])));
-    for (const list of results) for (const candidate of list) allCandidatesMap.set(candidate.slug, candidate);
-  }
 
-  const candidates = [...allCandidatesMap.values()].map((candidate) => {
+  // Try the current base first, then any failover bases from ANIKOTO_BASES. The one that works sticks.
+  const bases = [ANIKOTO, ...ANIKOTO_BASES.filter((base) => base !== ANIKOTO)];
+  const attempts = [];
+  let allCandidatesMap = new Map();
+  for (const base of bases) {
+    ANIKOTO = base;
+    const { found, diag } = await searchAllKeywords(keywords);
+    attempts.push(diag);
+    allCandidatesMap = found;
+    if (found.size) break;
+  }
+  if (!allCandidatesMap.size) ANIKOTO = bases[0];
+
+  const scored = [...allCandidatesMap.values()].map((candidate) => {
     const titleScore = titleIdentityScore(titles, [candidate.name, candidate.jp, candidate.slug.replace(/-/g, " ")]);
     return { ...candidate, titleScore, legacyScore: scoreCandidate(candidate, media.title?.english, media.title?.romaji, media.synonyms || []) };
-  }).filter((candidate) => candidate.titleScore >= 0.28)
+  });
+  const candidates = scored.filter((candidate) => candidate.titleScore >= 0.28)
     .sort((left, right) => right.titleScore - left.titleScore || right.legacyScore - left.legacyScore)
     .slice(0, 12);
 
-  if (!candidates.length) throw new Error(`No confident Anikoto title candidates for AniList ${media.id}`);
+  if (!candidates.length) {
+    const why = explainNoCandidates(attempts, scored);
+    const err = new Error(`No confident Anikoto title candidates for AniList ${media.id} [${why.reason}] ${why.text}`);
+    err.reason = why.reason;
+    throw err;
+  }
   const inspected = [];
+  const inspectErrors = [];
   for (let index = 0; index < candidates.length; index += 4) {
     const batch = await Promise.allSettled(candidates.slice(index, index + 4).map(inspectAnikotoCandidate));
-    for (const result of batch) if (result.status === "fulfilled" && result.value) inspected.push(result.value);
+    for (const result of batch) {
+      if (result.status === "fulfilled" && result.value) inspected.push(result.value);
+      else if (result.status === "rejected") inspectErrors.push(result.reason);
+    }
+  }
+  if (!inspected.length) {
+    const first = inspectErrors[0];
+    const err = new Error(`No confident Anikoto identity match for AniList ${media.id} [${first?.reason === "blocked" ? "blocked" : "inspect_failed"}] ${inspectErrors.length}/${candidates.length} candidate pages could not be read - first error: ${first?.message ?? "unknown"} (base ${ANIKOTO})`);
+    err.reason = first?.reason === "blocked" ? "blocked" : "inspect_failed";
+    throw err;
   }
 
   const expectedMal = Number(media.idMal) || null;
@@ -232,9 +355,41 @@ async function findAnikotoShow(media, anizip) {
   const chosen = viable[0];
   const runnerUp = viable[1];
   if (!chosen || runnerUp && chosen.titleScore - runnerUp.titleScore < 0.08) {
-    throw new Error(`No confident Anikoto identity match for AniList ${media.id}`);
+    const why = !chosen
+      ? `${inspected.length} page(s) read but none usable: ` + inspected.slice(0, 3).map((c) =>
+          `"${c.name}" (title ${c.titleScore.toFixed(2)}, ${c.episodes.some((e) => e.malId) ? `has MAL ids but none equal ${expectedMal}` : "no MAL ids"})`).join(", ")
+      : `two near-identical matches: "${chosen.name}" (${chosen.titleScore.toFixed(2)}) vs "${runnerUp.name}" (${runnerUp.titleScore.toFixed(2)})`;
+    const reason = !chosen ? "no_viable_match" : "ambiguous";
+    const err = new Error(`No confident Anikoto identity match for AniList ${media.id} [${reason}] ${why}`);
+    err.reason = reason;
+    throw err;
   }
   return { ...chosen, title: chosen.name, malId: expectedMal };
+}
+
+// Resolving a show costs up to ~40 upstream requests (18 searches + 2 per candidate). Doing that for every
+// episode click is what gets an IP rate-limited, so remember the result for a while.
+const SHOW_CACHE = new Map();
+const SHOW_INFLIGHT = new Map();
+const SHOW_TTL_AIRING = 5 * 60_000;
+const SHOW_TTL_DONE = 60 * 60_000;
+
+async function resolveShow(media, anizip, { fresh = false } = {}) {
+  const key = Number(media.id);
+  if (fresh) {
+    SHOW_CACHE.delete(key);
+  } else {
+    const hit = SHOW_CACHE.get(key);
+    if (hit && Date.now() - hit.at < hit.ttl) return { show: hit.show, fromCache: true, ageMs: Date.now() - hit.at };
+    if (SHOW_INFLIGHT.has(key)) return { show: await SHOW_INFLIGHT.get(key), fromCache: false, ageMs: 0 };
+  }
+  const promise = findAnikotoShow(media, anizip).then((show) => {
+    if (SHOW_CACHE.size >= 200) SHOW_CACHE.delete(SHOW_CACHE.keys().next().value);
+    SHOW_CACHE.set(key, { show, at: Date.now(), ttl: media.status === "FINISHED" ? SHOW_TTL_DONE : SHOW_TTL_AIRING });
+    return show;
+  }).finally(() => { if (SHOW_INFLIGHT.get(key) === promise) SHOW_INFLIGHT.delete(key); });
+  SHOW_INFLIGHT.set(key, promise);
+  return { show: await promise, fromCache: false, ageMs: 0 };
 }
 
 function mapTrack(t, source) {
@@ -274,7 +429,7 @@ export async function getEpisodes(anilistId, ctx = {}) {
   if (!media) throw new Error(`Could not resolve media for AniList ID: ${anilistId}`);
 
   const anizipRes = ctx.anizip ?? await getJSON(`${ANIZIP}?anilist_id=${anilistId}`).catch(() => null);
-  const show = await findAnikotoShow(media, anizipRes);
+  const { show } = await resolveShow(media, anizipRes);
   const sub = [];
   const dub = [];
   for (const row of show.episodes) {
@@ -335,8 +490,15 @@ async function handleWatch(anilistId, audio, epNum, ctx = {}) {
     return jsonResponse({ error: `Could not resolve media for AniList ID: ${anilistId}` }, 400);
   }
 
-  const show = await findAnikotoShow(media, ctx.anizip);
-  const targetEp = show.episodes.find((episode) => episode.number === Number(epNum) && episode[audio === "sub" ? "hasSub" : "hasDub"]);
+  const findEp = (list) => list.episodes.find((episode) => episode.number === Number(epNum) && episode[audio === "sub" ? "hasSub" : "hasDub"]);
+  let { show, fromCache, ageMs } = await resolveShow(media, ctx.anizip);
+  let targetEp = findEp(show);
+  if (!targetEp?.ids && fromCache && ageMs > 30_000) {
+    // the cached episode list may predate a new release - re-resolve once before giving up
+    // (the 30s floor stops a request for a non-existent episode from forcing a refresh every time)
+    ({ show } = await resolveShow(media, ctx.anizip, { fresh: true }));
+    targetEp = findEp(show);
+  }
 
   if (!targetEp?.ids) {
     return jsonResponse({ error: `Episode ${epNum} not found for show: ${show.title}` }, 404);
@@ -550,7 +712,7 @@ async function handleWatch(anilistId, audio, epNum, ctx = {}) {
     downloads,
     headers: {
       "User-Agent": UA,
-      "Referer": streams[0]?.referer || "https://anikototv.to/"
+      "Referer": streams[0]?.referer || `${ANIKOTO}/`
     }
   });
 }
@@ -587,7 +749,7 @@ export default {
       }
       return jsonResponse({ error: "Not found" }, 404);
     } catch (err) {
-      return jsonResponse({ error: err.message, stack: err.stack }, 500);
+      return jsonResponse({ error: err.message, reason: err.reason ?? null, stack: err.stack }, 500);
     }
   }
 };
